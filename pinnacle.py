@@ -61,6 +61,8 @@ def _process_market_event(event: dict):
     outcome    = event.get("outcome", "")
     sect       = event.get("sect", "").lower()
     interval   = int(event.get("interval", 0) or 0)
+    home_score = event.get("home_score")   # games/sets jugados
+    away_score = event.get("away_score")
 
     if not event_id or from_price == 0 or to_price == 0:
         logger.debug(f"[PINNACLE] Evento tenis incompleto — id={event_id} from={from_price} to={to_price}")
@@ -74,20 +76,20 @@ def _process_market_event(event: dict):
     if interval >= 120:
         signals.append("market_suspended")
         score += SPI_WEIGHTS_PINNACLE["market_suspended"]
-        logger.info(f"[PINNACLE] {home} vs {away} — market_suspended (interval={interval}min) +{SPI_WEIGHTS_PINNACLE['market_suspended']}")
+        logger.info(f"  PIN +{SPI_WEIGHTS_PINNACLE['market_suspended']:<2} → 💰 Mercado suspendido (interval={interval}min) [{home} vs {away}]")
     elif interval >= 60:
         signals.append("market_slow_return")
         score += SPI_WEIGHTS_PINNACLE["market_slow_return"]
-        logger.info(f"[PINNACLE] {home} vs {away} — market_slow_return (interval={interval}min) +{SPI_WEIGHTS_PINNACLE['market_slow_return']}")
+        logger.info(f"  PIN +{SPI_WEIGHTS_PINNACLE['market_slow_return']:<2} → 💰 Mercado tardó en retomar (interval={interval}min) [{home} vs {away}]")
 
     if drop_pct >= 15 and interval <= 30:
         signals.append("odds_spike")
         score += SPI_WEIGHTS_PINNACLE["odds_spike"]
-        logger.info(f"[PINNACLE] {home} vs {away} — odds_spike drop={drop_pct:.1f}% interval={interval}min +{SPI_WEIGHTS_PINNACLE['odds_spike']}")
+        logger.info(f"  PIN +{SPI_WEIGHTS_PINNACLE['odds_spike']:<2} → 💰 Cuota subió fuerte y rápido (drop={drop_pct:.1f}% en {interval}min) [{home} vs {away}]")
     elif drop_pct >= PINNODDS_MIN_DROP_PCT:
         signals.append("no_recovery_movement")
         score += SPI_WEIGHTS_PINNACLE["no_recovery_movement"]
-        logger.debug(f"[PINNACLE] {home} vs {away} — no_recovery_movement drop={drop_pct:.1f}% +{SPI_WEIGHTS_PINNACLE['no_recovery_movement']}")
+        logger.debug(f"  PIN +{SPI_WEIGHTS_PINNACLE['no_recovery_movement']:<2} → 💰 Movimiento sin recuperación (drop={drop_pct:.1f}%) [{home} vs {away}]")
 
     if not signals:
         return
@@ -127,6 +129,12 @@ def _process_market_event(event: dict):
         final_opportunity = opportunity_player or current.get("opportunity_player")
         final_risk_odds   = risk_odds          or current.get("risk_odds")
 
+        # Calcular total de games jugados
+        try:
+            total_games = (int(home_score or 0)) + (int(away_score or 0))
+        except (TypeError, ValueError):
+            total_games = current.get("total_games", 0)
+
         _market_states[event_id] = {
             "signals":            list(existing_signals),
             "market_spi":         max(current.get("market_spi", 0), score),
@@ -139,6 +147,7 @@ def _process_market_event(event: dict):
             "risk_player":        final_risk,
             "opportunity_player": final_opportunity,
             "risk_odds":          final_risk_odds,
+            "total_games":        max(current.get("total_games", 0), total_games),
         }
 
 
@@ -233,6 +242,7 @@ def _empty_state() -> dict:
         "risk_player":        None,
         "opportunity_player": None,
         "risk_odds":          None,
+        "total_games":        0,
     }
 
 
@@ -249,6 +259,7 @@ def _export_state(state: dict) -> dict:
         "risk_player":        state.get("risk_player"),
         "opportunity_player": state.get("opportunity_player"),
         "risk_odds":          state.get("risk_odds"),
+        "total_games":        state.get("total_games", 0),
     }
 
 

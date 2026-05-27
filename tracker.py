@@ -162,10 +162,7 @@ def _build_context_flags(match: dict, prev: dict | None) -> dict:
     # Log solo si hay algún flag activo
     active = [k for k, v in flags.items() if v]
     if active:
-        logger.debug(
-            f"[CONTEXT] {match.get('player_home','?')} vs {match.get('player_away','?')} "
-            f"— flags activos: {active}"
-        )
+        logger.debug(f"  ⚑  Flags activos: {', '.join(active)} [{match.get('player_home','?')} vs {match.get('player_away','?')}]")
 
     return flags
 
@@ -189,10 +186,10 @@ def _detect_score_freeze(match_id: str, current_score: str) -> int:
     frozen_seconds = (now - last_change_time).total_seconds()
 
     if frozen_seconds >= 600:
-        logger.debug(f"[FREEZE] match_id={match_id} congelado {frozen_seconds:.0f}s → +10 pts SPI")
+        logger.debug(f"  GS  +10 → Score congelado {frozen_seconds:.0f}s (10+ min)")
         return SPI_WEIGHTS_GOALSERVE["score_frozen_10min"]
     if frozen_seconds >= 300:
-        logger.debug(f"[FREEZE] match_id={match_id} congelado {frozen_seconds:.0f}s → +5 pts SPI")
+        logger.debug(f"  GS  +5  → Score congelado {frozen_seconds:.0f}s (5–7 min)")
         return SPI_WEIGHTS_GOALSERVE["score_frozen_5min"]
     return 0
 
@@ -208,7 +205,7 @@ def _calculate_cancha_spi(match: dict, match_id: str) -> tuple[int, list[str]]:
     if any(k in status for k in ["suspended", "interrupted", "walkover", "retired", "retire"]):
         signals.append("match_suspended")
         score += SPI_WEIGHTS_GOALSERVE["match_suspended"]
-        logger.info(f"[SPI-CANCHA] {home} vs {away} — match_suspended (status='{status}') +{SPI_WEIGHTS_GOALSERVE['match_suspended']}")
+        logger.info(f"  GS  +{SPI_WEIGHTS_GOALSERVE['match_suspended']:<2} → Partido suspendido (status='{status}') [{home} vs {away}]")
 
     # Bajón de rendimiento por pérdida de sets
     home_sets = match.get("home_sets_won", 0)
@@ -218,7 +215,7 @@ def _calculate_cancha_spi(match: dict, match_id: str) -> tuple[int, list[str]]:
     if prev_home > home_sets and home_sets == 0:
         signals.append("performance_drop")
         score += SPI_WEIGHTS_GOALSERVE["performance_drop"]
-        logger.info(f"[SPI-CANCHA] {home} vs {away} — performance_drop (sets: {prev_home}→{home_sets}) +{SPI_WEIGHTS_GOALSERVE['performance_drop']}")
+        logger.info(f"  GS  +{SPI_WEIGHTS_GOALSERVE['performance_drop']:<2} → Bajón de rendimiento (sets: {prev_home}→{home_sets}) [{home} vs {away}]")
 
     # Breaks consecutivos
     home_serve   = match.get("home_serve", False)
@@ -236,7 +233,7 @@ def _calculate_cancha_spi(match: dict, match_id: str) -> tuple[int, list[str]]:
     if consec_breaks >= 3:
         signals.append("consecutive_breaks")
         score += SPI_WEIGHTS_GOALSERVE["consecutive_breaks"]
-        logger.info(f"[SPI-CANCHA] {home} vs {away} — consecutive_breaks ({consec_breaks}) +{SPI_WEIGHTS_GOALSERVE['consecutive_breaks']}")
+        logger.info(f"  GS  +{SPI_WEIGHTS_GOALSERVE['consecutive_breaks']:<2} → Pierde servicios seguidos ({consec_breaks}) [{home} vs {away}]")
 
     # Score congelado
     current_score = (
@@ -246,8 +243,10 @@ def _calculate_cancha_spi(match: dict, match_id: str) -> tuple[int, list[str]]:
     freeze_pts = _detect_score_freeze(match_id, current_score)
     if freeze_pts > 0:
         tag = "score_frozen_10min" if freeze_pts == 10 else "score_frozen_5min"
+        min_label = "10+ min" if freeze_pts == 10 else "5–7 min"
         signals.append(tag)
         score += freeze_pts
+        logger.info(f"  GS  +{freeze_pts:<2} → Score congelado {min_label} [{home} vs {away}]")
 
     # Guardar estado
     _match_states[match_id]["_home_sets_won"] = home_sets

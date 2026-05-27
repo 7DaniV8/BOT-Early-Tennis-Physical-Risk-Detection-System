@@ -122,7 +122,9 @@ def _resolve_alert_level(spi: int, both_sources: bool) -> str:
         return "amber"
     if spi >= SPI_THRESHOLD_AMBER and both_sources:
         return "amber"
-    return "yellow"
+    if spi >= SPI_THRESHOLD_AMBER and not both_sources:
+        return "amber"   # antes era yellow — ahora mínimo es amber
+    return None   # por debajo del umbral → no alerta
 
 
 def _apply_reductions(spi: int, is_challenger: bool, api_delay: bool = False) -> tuple[int, list[str]]:
@@ -183,6 +185,8 @@ def evaluate_match(match_data: dict, all_goalserve_matches: list[dict]) -> dict 
         return None
 
     alert_level = _resolve_alert_level(adjusted_spi, both_sources)
+    if alert_level is None:
+        return None
 
     return {
         "match_id":           match_id,
@@ -234,7 +238,7 @@ def evaluate_pinnacle_only(event_id: str, market_state: dict) -> dict | None:
     if adjusted_spi < SPI_THRESHOLD_AMBER:
         return None
 
-    alert_level = "amber" if adjusted_spi >= SPI_THRESHOLD_RED else "yellow"
+    alert_level = "amber"   # fuente única → siempre amber, nunca rojo
 
     return {
         "match_id":           event_id,

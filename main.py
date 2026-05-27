@@ -1,7 +1,5 @@
 # ============================================================
 #  FULLTENNIS SPI BOT — main.py
-#  Orquesta todo. Loop principal GoalServe + SSE Pinnacle.
-#  Manejo de errores granular + logs descriptivos.
 # ============================================================
 
 import logging
@@ -36,14 +34,76 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-# ── Contadores de ciclo ───────────────────────────────────────
 _cycle_count        = 0
 _total_alerts_sent  = 0
 _consecutive_errors = 0
-MAX_CONSECUTIVE_ERRORS = 10   # si falla 10 ciclos seguidos → reinicio suave
+MAX_CONSECUTIVE_ERRORS = 10
 
 
-# ── Matcher por apellido GoalServe ↔ Pinnacle ─────────────────
+# ── Helpers de señales ────────────────────────────────────────
+
+def _signal_label(signal: str) -> str:
+    labels = {
+        "match_suspended":      "Partido suspendido / interrumpido",
+        "performance_drop":     "Bajón fuerte de rendimiento",
+        "consecutive_breaks":   "Pierde servicios seguidos (3+)",
+        "serve_speed_drop":     "Caída del saque",
+        "no_break_points":      "Sin break points generados",
+        "score_frozen_10min":   "Score congelado 10+ min",
+        "score_frozen_5min":    "Score congelado 5–7 min",
+        "market_suspended":     "Mercado suspendido",
+        "odds_disappeared":     "Cuota desaparece del mercado",
+        "odds_spike":           "Cuota subió fuerte y rápido",
+        "no_recovery_movement": "Movimiento fuerte sin recuperación",
+        "market_slow_return":   "Mercado tardó en retomar",
+    }
+    return labels.get(signal, signal)
+
+
+def _signal_weight(signal: str) -> int:
+    from config import SPI_WEIGHTS_GOALSERVE, SPI_WEIGHTS_PINNACLE
+    return SPI_WEIGHTS_GOALSERVE.get(signal, SPI_WEIGHTS_PINNACLE.get(signal, 0))
+
+
+def _log_alert(player_home: str, player_away: str, tournament: str,
+               status: str, cancha_spi: int, cancha_signals: list,
+               market_spi: int, market_signals: list, total_spi: int,
+               adjusted_spi: int, alert_level: str, both_sources: bool,
+               reductions: list, veto: str = None, sent: bool = None):
+    """Log limpio y legible para cada partido con señal."""
+    lines = [f"\n→ {player_home} vs {player_away} | {tournament} | {status}"]
+
+    for sig in cancha_signals:
+        pts = _signal_weight(sig)
+        lines.append(f"     GS  +{pts:<2} → {_signal_label(sig)}")
+
+    for sig in market_signals:
+        pts = _signal_weight(sig)
+        lines.append(f"     PIN +{pts:<2} → 💰 {_signal_label(sig)}")
+
+    if veto:
+        lines.append(f"     ⛔ VETADO — {veto}")
+        logger.info("\n".join(lines))
+        return
+
+    if reductions:
+        lines.append(f"     ⚙️  Ajuste: {', '.join(reductions)}")
+
+    spi_str = f"Total SPI={total_spi}"
+    if adjusted_spi != total_spi:
+        spi_str += f" → ajustado={adjusted_spi}"
+    fuentes = "✅ ambas fuentes" if both_sources else "⚠️  fuente única"
+    lines.append(f"     {spi_str} | nivel={alert_level.upper()} | {fuentes}")
+
+    if sent is True:
+        lines.append(f"     [✅ Telegram] Alerta enviada")
+    elif sent is False:
+        lines.append(f"     [⏸ Telegram] En cooldown — no enviada")
+
+    logger.info("\n".join(lines))
+
+
+# ── Matcher por apellido ──────────────────────────────────────
 
 def _extract_surnames(full_name: str) -> set[str]:
     name = full_name.lower().strip()
@@ -51,18 +111,6 @@ def _extract_surnames(full_name: str) -> set[str]:
         name = name[3:].strip()
     parts = name.replace("-", " ").split()
     return {p for p in parts if len(p) > 2}
-
-
-def _find_goalserve_match(pinnacle_home: str, pinnacle_away: str,
-                           goalserve_matches: list[dict]) -> dict | None:
-    pin_surnames_h = _extract_surnames(pinnacle_home)
-    pin_surnames_a = _extract_surnames(pinnacle_away)
-    for gm in goalserve_matches:
-        gs_surnames_h = _extract_surnames(gm.get("player_home", ""))
-        gs_surnames_a = _extract_surnames(gm.get("player_away", ""))
-        if bool(pin_surnames_h & gs_surnames_h) and bool(pin_surnames_a & gs_surnames_a):
-            return gm
-    return None
 
 
 # ── SPI Engine ────────────────────────────────────────────────
@@ -102,11 +150,13 @@ def evaluate_match(match_data: dict, all_goalserve_matches: list[dict]) -> dict 
     cancha_signals = match_data["cancha_signals"]
     context_flags  = match_data["context_flags"]
     is_challenger  = match_data["is_challenger"]
+    tournament     = match_data["tournament"]
+    status         = match_data["status"]
 
     try:
         pin_state = pinnacle.find_market_state_by_name(player_home, player_away)
     except Exception as e:
-        logger.error(f"[EVALUATE] Error buscando estado Pinnacle para {player_home} vs {player_away}: {e}")
+        logger.error(f"[EVALUATE] Error buscando Pinnacle para {player_home} vs {player_away}: {e}")
         pin_state = pinnacle._empty_state()
 
     market_spi     = pin_state["market_spi"]
@@ -120,10 +170,10 @@ def evaluate_match(match_data: dict, all_goalserve_matches: list[dict]) -> dict 
     # Verificar vetos
     active_vetos = _check_vetos(context_flags)
     if active_vetos:
-        logger.info(
-            f"[VETO] {player_home} vs {player_away} | "
-            f"SPI={total_spi} bloqueado por: {', '.join(active_vetos)}"
-        )
+        _log_alert(player_home, player_away, tournament, status,
+                   cancha_spi, cancha_signals, market_spi, market_signals,
+                   total_spi, total_spi, "vetado", both_sources, [],
+                   veto=", ".join(active_vetos))
         notifier.send_veto_log(match_id, player_home, player_away, total_spi, active_vetos)
         return None
 
@@ -134,23 +184,12 @@ def evaluate_match(match_data: dict, all_goalserve_matches: list[dict]) -> dict 
 
     alert_level = _resolve_alert_level(adjusted_spi, both_sources)
 
-    # Log detallado de por qué sonó la alerta
-    logger.info(
-        f"[ALERTA {alert_level.upper()}] {player_home} vs {player_away} | "
-        f"SPI bruto={total_spi} ajustado={adjusted_spi} | "
-        f"Cancha={cancha_spi} {cancha_signals} | "
-        f"Mercado={market_spi} {market_signals} | "
-        f"Ambas fuentes={both_sources} | "
-        f"Reducciones={reductions} | "
-        f"Torneo={match_data['tournament']}"
-    )
-
     return {
         "match_id":           match_id,
         "player_home":        player_home,
         "player_away":        player_away,
-        "tournament":         match_data["tournament"],
-        "status":             match_data["status"],
+        "tournament":         tournament,
+        "status":             status,
         "total_spi":          total_spi,
         "adjusted_spi":       adjusted_spi,
         "alert_level":        alert_level,
@@ -176,8 +215,17 @@ def evaluate_pinnacle_only(event_id: str, market_state: dict) -> dict | None:
     home           = market_state.get("home", "")
     away           = market_state.get("away", "")
     league         = market_state.get("league", "")
+    total_games    = market_state.get("total_games", 0)
 
     if market_spi < SPI_THRESHOLD_AMBER:
+        return None
+
+    # Filtro: partido recién iniciado
+    if total_games < 3:
+        _log_alert(home, away, league, "in_progress",
+                   0, [], market_spi, market_signals,
+                   market_spi, market_spi, "vetado", False, [],
+                   veto=f"partido recién iniciado (games={total_games})")
         return None
 
     is_challenger = any(k in league.lower() for k in ["challenger", "itf", "125k", "future"])
@@ -187,13 +235,6 @@ def evaluate_pinnacle_only(event_id: str, market_state: dict) -> dict | None:
         return None
 
     alert_level = "amber" if adjusted_spi >= SPI_THRESHOLD_RED else "yellow"
-
-    logger.info(
-        f"[ALERTA PINNACLE-ONLY {alert_level.upper()}] {home} vs {away} | "
-        f"SPI bruto={market_spi} ajustado={adjusted_spi} | "
-        f"Señales={market_signals} | "
-        f"Liga={league} | Reducciones={reductions}"
-    )
 
     return {
         "match_id":           event_id,
@@ -232,21 +273,15 @@ def _validate_config():
     if not TELEGRAM_BOT_TOKEN: missing.append("TELEGRAM_BOT_TOKEN")
     if not TELEGRAM_CHAT_ID:   missing.append("TELEGRAM_CHAT_ID")
     if missing:
-        logger.critical(f"[CONFIG] Variables faltantes: {', '.join(missing)} — el bot no puede iniciar")
+        logger.critical(f"[CONFIG] Variables faltantes: {', '.join(missing)}")
         sys.exit(1)
 
 
-# ── Un ciclo completo de evaluación ──────────────────────────
+# ── Un ciclo completo ─────────────────────────────────────────
 
 def _run_cycle() -> tuple[int, int]:
-    """
-    Ejecuta un ciclo completo de evaluación.
-    Retorna (partidos_evaluados, alertas_enviadas).
-    Lanza excepción si algo falla — el caller decide cómo manejarla.
-    """
     alerts_sent = 0
 
-    # ── GoalServe ────────────────────────────────────────────
     try:
         matches = tracker.process_matches()
     except Exception as e:
@@ -255,15 +290,12 @@ def _run_cycle() -> tuple[int, int]:
 
     active_ids = [m["match_id"] for m in matches]
 
-    # Path 1: partidos cubiertos por GoalServe + cruce con Pinnacle
+    # Path 1: GoalServe + cruce Pinnacle
     for match_data in matches:
         try:
             alert = evaluate_match(match_data, matches)
         except Exception as e:
-            logger.error(
-                f"[EVALUATE] Error evaluando {match_data.get('player_home','?')} vs "
-                f"{match_data.get('player_away','?')}: {e}"
-            )
+            logger.error(f"[EVALUATE] {match_data.get('player_home','?')} vs {match_data.get('player_away','?')}: {e}")
             continue
 
         if alert:
@@ -271,19 +303,25 @@ def _run_cycle() -> tuple[int, int]:
                 level    = alert["alert_level"]
                 cooldown = ALERT_COOLDOWN_SECONDS.get(level, 300)
                 sent     = notifier.send_alert(alert, cooldown_seconds=cooldown)
+                _log_alert(
+                    alert["player_home"], alert["player_away"],
+                    alert["tournament"], alert["status"],
+                    alert["cancha_spi"], alert["cancha_signals"],
+                    alert["market_spi"], alert["market_signals"],
+                    alert["total_spi"], alert["adjusted_spi"],
+                    alert["alert_level"], alert["both_sources"],
+                    alert["reductions"], sent=sent
+                )
                 if sent:
                     alerts_sent += 1
             except Exception as e:
-                logger.error(
-                    f"[NOTIFIER] Error enviando alerta para "
-                    f"{alert.get('player_home','?')} vs {alert.get('player_away','?')}: {e}"
-                )
+                logger.error(f"[NOTIFIER] {alert.get('player_home','?')} vs {alert.get('player_away','?')}: {e}")
 
-    # ── Pinnacle-only: partidos que GoalServe no cubre ────────
+    # Path 2: Pinnacle-only
     try:
         pinnacle_tennis = pinnacle.get_all_tennis_states()
     except Exception as e:
-        logger.error(f"[PINNACLE] Error obteniendo estados de mercado: {e}")
+        logger.error(f"[PINNACLE] Error obteniendo estados: {e}")
         pinnacle_tennis = {}
 
     gs_names = set()
@@ -292,13 +330,13 @@ def _run_cycle() -> tuple[int, int]:
         gs_names.update(_extract_surnames(m["player_away"]))
 
     for event_id, market_state in pinnacle_tennis.items():
-        home_surnames = _extract_surnames(market_state.get("home", ""))
-        away_surnames = _extract_surnames(market_state.get("away", ""))
-        if not (home_surnames & gs_names) and not (away_surnames & gs_names):
+        home_s = _extract_surnames(market_state.get("home", ""))
+        away_s = _extract_surnames(market_state.get("away", ""))
+        if not (home_s & gs_names) and not (away_s & gs_names):
             try:
                 alert = evaluate_pinnacle_only(event_id, market_state)
             except Exception as e:
-                logger.error(f"[EVALUATE-PIN] Error evaluando event_id={event_id}: {e}")
+                logger.error(f"[EVALUATE-PIN] event_id={event_id}: {e}")
                 continue
 
             if alert:
@@ -306,16 +344,24 @@ def _run_cycle() -> tuple[int, int]:
                     level    = alert["alert_level"]
                     cooldown = ALERT_COOLDOWN_SECONDS.get(level, 300)
                     sent     = notifier.send_alert(alert, cooldown_seconds=cooldown)
+                    _log_alert(
+                        alert["player_home"], alert["player_away"],
+                        alert["tournament"], alert["status"],
+                        0, [],
+                        alert["market_spi"], alert["market_signals"],
+                        alert["total_spi"], alert["adjusted_spi"],
+                        alert["alert_level"], False,
+                        alert["reductions"], sent=sent
+                    )
                     if sent:
                         alerts_sent += 1
                 except Exception as e:
-                    logger.error(f"[NOTIFIER] Error enviando alerta Pinnacle-only {event_id}: {e}")
+                    logger.error(f"[NOTIFIER-PIN] event_id={event_id}: {e}")
 
-    # Limpiar partidos terminados
     try:
         tracker.cleanup_finished_matches(active_ids)
     except Exception as e:
-        logger.warning(f"[CLEANUP] Error limpiando partidos terminados: {e}")
+        logger.warning(f"[CLEANUP] {e}")
 
     return len(matches) + len(pinnacle_tennis), alerts_sent
 
@@ -331,22 +377,19 @@ def main():
 
     _validate_config()
 
-    # Mensaje de inicio a Telegram
     try:
         notifier.send_startup_message()
     except Exception as e:
-        logger.warning(f"[STARTUP] No se pudo enviar mensaje de inicio a Telegram: {e}")
+        logger.warning(f"[STARTUP] No se pudo enviar mensaje de inicio: {e}")
 
-    # Pinnacle SSE en hilo daemon
     try:
         pinnacle.start_stream()
-        logger.info("[PINNACLE] Stream SSE iniciado correctamente")
+        logger.info("[PINNACLE] Stream SSE iniciado")
     except Exception as e:
         logger.critical(f"[PINNACLE] No se pudo iniciar el stream SSE: {e}")
         sys.exit(1)
 
-    # Offset inicial
-    logger.info(f"[GOALSERVE] Polling cada {GOALSERVE_POLL_INTERVAL}s — offset inicial {GOALSERVE_POLL_OFFSET}s")
+    logger.info(f"[GOALSERVE] Polling cada {GOALSERVE_POLL_INTERVAL}s — offset {GOALSERVE_POLL_OFFSET}s")
     time.sleep(GOALSERVE_POLL_OFFSET)
 
     while True:
@@ -356,13 +399,13 @@ def main():
         try:
             evaluated, alerts = _run_cycle()
             _total_alerts_sent  += alerts
-            _consecutive_errors  = 0   # reset al tener un ciclo exitoso
+            _consecutive_errors  = 0
 
             logger.info(
                 f"[CICLO #{_cycle_count}] "
                 f"Evaluados={evaluated} | "
-                f"Alertas este ciclo={alerts} | "
-                f"Total alertas={_total_alerts_sent}"
+                f"Alertas={alerts} | "
+                f"Total={_total_alerts_sent}"
             )
 
         except Exception as e:
@@ -372,14 +415,10 @@ def main():
                 f"(consecutivos={_consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}\n"
                 f"{traceback.format_exc()}"
             )
-
             if _consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                logger.critical(
-                    f"[CICLO] {MAX_CONSECUTIVE_ERRORS} errores consecutivos — "
-                    f"reiniciando proceso en 60s"
-                )
+                logger.critical(f"[CICLO] {MAX_CONSECUTIVE_ERRORS} errores seguidos — reiniciando en 60s")
                 try:
-                    notifier.send_startup_message()   # re-notifica en Telegram
+                    notifier.send_startup_message()
                 except Exception:
                     pass
                 time.sleep(60)
@@ -387,11 +426,7 @@ def main():
 
         elapsed    = time.time() - cycle_start
         sleep_time = max(0, GOALSERVE_POLL_INTERVAL - elapsed)
-        logger.debug(
-            f"[CICLO #{_cycle_count}] "
-            f"Duración={elapsed:.1f}s | "
-            f"Próximo en {sleep_time:.1f}s"
-        )
+        logger.debug(f"[CICLO #{_cycle_count}] Duración={elapsed:.1f}s | Próximo en {sleep_time:.1f}s")
         time.sleep(sleep_time)
 
 

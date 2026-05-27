@@ -82,21 +82,8 @@ def _alert_level(spi: int, both_sources: bool) -> tuple[str, str]:
 
 
 def build_message(data: dict) -> str:
-    """
-    Construye el mensaje Telegram con el formato limpio de FullTennis.
-
-    Formato:
-    🚨 FullTennis — Sistema de Monitoreo Físico
-    🎾 L. Darderi (1.35) | S. Ofner (3.16)
-    🎯 Riesgo detectado en: L. DARDERI
-    📈 Oportunidad en: S. OFNER
-    ⚠️ Revisar antes de entrar.
-    """
-    spi          = data["adjusted_spi"]
-    both         = data["both_sources"]
-    now_str      = datetime.now(timezone.utc).strftime("%H:%M UTC")
-
-    # Jugadores y cuotas
+    spi        = data["adjusted_spi"]
+    both       = data["both_sources"]
     home       = data["player_home"]
     away       = data["player_away"]
     home_odds  = data.get("home_odds")
@@ -104,7 +91,6 @@ def build_message(data: dict) -> str:
     risk       = data.get("risk_player")
     opp        = data.get("opportunity_player")
 
-    # Formato corto de nombre: "Luciano Darderi" → "L. Darderi"
     def short_name(name: str) -> str:
         parts = name.strip().split()
         if len(parts) >= 2:
@@ -116,37 +102,18 @@ def build_message(data: dict) -> str:
 
     home_short = short_name(home)
     away_short = short_name(away)
-    risk_short = short_name(risk) if risk else short_name(home)
-    opp_short  = short_name(opp)  if opp  else short_name(away)
+    risk_short = short_name(risk).upper() if risk else short_name(home).upper()
+    opp_short  = short_name(opp).upper()  if opp  else short_name(away).upper()
 
-    # Línea de jugadores con cuotas
-    players_line = f"🎾 {home_short} ({fmt_odds(home_odds)}) | {away_short} ({fmt_odds(away_odds)})"
+    msg  = f"🚨 FullTennis — Sistema de Monitoreo Físico\n"
+    msg += f"🎾 {home_short} ({fmt_odds(home_odds)}) | {away_short} ({fmt_odds(away_odds)})\n"
+    msg += f"🎯 Riesgo detectado en: *{risk_short}*\n"
+    msg += f"📈 Oportunidad en: *{opp_short}*\n"
 
-    # Encabezado según nivel
-    _, nivel = _alert_level(spi, both)
+    if not both:
+        msg += f"⚡ Solo una fuente activa\n"
 
-    msg  = f"🚨 *FullTennis — Sistema de Monitoreo Físico*\n"
-    msg += f"{players_line}\n"
-    msg += f"🎯 Riesgo detectado en: *{risk_short.upper()}*\n"
-    msg += f"📈 Oportunidad en: *{opp_short.upper()}*\n"
-    msg += f"⚠️ Revisar antes de entrar.\n"
-
-    # Bloque secundario con detalles (colapsado visualmente)
-    msg += f"─────────────────────\n"
-    msg += f"📊 SPI: *{spi}*"
-    if data["total_spi"] != spi:
-        msg += f" _(bruto: {data['total_spi']})_"
-    msg += f" | {nivel}\n"
-    msg += f"🏆 {data['tournament']}\n"
-    msg += f"🕐 {now_str}"
-
-    # Fuente única → advertencia
-    if not both and spi >= SPI_THRESHOLD_RED:
-        msg += f"\n⚡ _Solo una fuente activa — confirmar antes de actuar_"
-
-    # Reducciones aplicadas
-    if data.get("reductions"):
-        msg += f"\n⚙️ _{', '.join(data['reductions'])}_"
+    msg += f"⚠️ Revisar antes de entrar."
 
     return msg
 

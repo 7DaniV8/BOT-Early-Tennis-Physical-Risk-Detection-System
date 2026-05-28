@@ -16,6 +16,7 @@ from config import (
     SPI_REDUCTION_API_DELAY,
     VETO_FLAGS,
     ALERT_COOLDOWN_SECONDS,
+    IMMEDIATE_ALERT_SIGNALS,
     LOG_LEVEL,
     LOG_FILE,
 )
@@ -45,18 +46,19 @@ MAX_CONSECUTIVE_ERRORS = 10
 
 def _signal_label(signal: str) -> str:
     labels = {
+        # GoalServe
+        "walkover_noshown":     "🚨 Walkover / No Show",
         "match_suspended":      "Partido suspendido / interrumpido",
-        "performance_drop":     "Bajón fuerte de rendimiento",
-        "consecutive_breaks":   "Pierde servicios seguidos (3+)",
-        "serve_speed_drop":     "Caída del saque",
-        "no_break_points":      "Sin break points generados",
+        "consecutive_breaks":   "3 veces a 0-40 con saque propio",
+        "game_lost_from_4000":  "Perdió game desde 40-0 arriba",
         "score_frozen_10min":   "Score congelado 10+ min",
         "score_frozen_5min":    "Score congelado 5–7 min",
-        "market_suspended":     "Mercado suspendido",
-        "odds_disappeared":     "Cuota desaparece del mercado",
-        "odds_spike":           "Cuota subió fuerte y rápido",
-        "no_recovery_movement": "Movimiento fuerte sin recuperación",
-        "market_slow_return":   "Mercado tardó en retomar",
+        # Pinnacle
+        "odds_disappeared":     "🚨 Cuota desaparece del mercado",
+        "market_suspended":     "Mercado suspendido (2–15 min)",
+        "odds_spike":           "Cuota sube 15%+ rápido",
+        "no_recovery_movement": "Cuota sube 5–14% sin recuperar",
+        "odds_trend":           "Tendencia alcista en 3 movimientos",
     }
     return labels.get(signal, signal)
 
@@ -93,13 +95,35 @@ def _log_alert(player_home: str, player_away: str, tournament: str,
     spi_str = f"Total SPI={total_spi}"
     if adjusted_spi != total_spi:
         spi_str += f" → ajustado={adjusted_spi}"
-    fuentes = "✅ ambas fuentes" if both_sources else "⚠️  fuente única"
-    lines.append(f"     {spi_str} | nivel={alert_level.upper()} | {fuentes}")
+
+    # Nivel visual
+    if alert_level == "immediate":
+        nivel_str = "nivel=🚨 ALERTA INMEDIATA"
+        fuentes   = "✅ señal crítica"
+    elif alert_level == "red":
+        nivel_str = "nivel=ALERTA ROJA"
+        fuentes   = "✅ doble fuente"
+    elif alert_level == "amber" and both_sources:
+        nivel_str = "nivel=AMBER"
+        fuentes   = "✅ doble fuente"
+    elif alert_level == "amber" and not both_sources:
+        nivel_str = "nivel=OBSERVACIÓN"
+        fuentes   = "⚠️  fuente única"
+    else:
+        nivel_str = f"nivel={alert_level.upper()}"
+        fuentes   = "✅ doble fuente" if both_sources else "⚠️  fuente única"
+
+    lines.append(f"     {spi_str} | {nivel_str} | {fuentes}")
 
     if sent is True:
-        lines.append(f"     [✅ Telegram] Alerta enviada")
+        if both_sources:
+            lines.append(f"     [📲 Telegram] Enviada — GoalServe + Pinnacle confirmados")
+        else:
+            lines.append(f"     [📲 Telegram] Enviada — señal Pinnacle extrema")
     elif sent is False:
         lines.append(f"     [⏸ Telegram] En cooldown — no enviada")
+    elif sent is None:
+        lines.append(f"     [⚠️  OBSERVACIÓN] Fuente única — no enviada a Telegram")
 
     logger.info("\n".join(lines))
 
@@ -169,6 +193,35 @@ def evaluate_match(match_data: dict, all_goalserve_matches: list[dict]) -> dict 
 
     if total_spi == 0:
         return None
+
+    # Alerta inmediata — walkover, no show, odds_disappeared
+    # Pasa todos los filtros sin importar SPI ni doble fuente
+    all_signals = set(cancha_signals) | set(market_signals)
+    is_immediate = any(s in IMMEDIATE_ALERT_SIGNALS for s in all_signals)
+    if is_immediate:
+        logger.info(f"  🚨 ALERTA INMEDIATA — señal crítica detectada [{player_home} vs {player_away}]")
+        return {
+            "match_id":           match_id,
+            "player_home":        player_home,
+            "player_away":        player_away,
+            "tournament":         tournament,
+            "status":             status,
+            "total_spi":          total_spi,
+            "adjusted_spi":       total_spi,
+            "alert_level":        "immediate",
+            "cancha_spi":         cancha_spi,
+            "cancha_signals":     cancha_signals,
+            "market_spi":         market_spi,
+            "market_signals":     market_signals,
+            "both_sources":       both_sources,
+            "reductions":         [],
+            "context_flags":      context_flags,
+            "is_challenger":      is_challenger,
+            "home_odds":          pin_state.get("home_odds"),
+            "away_odds":          pin_state.get("away_odds"),
+            "risk_player":        pin_state.get("risk_player"),
+            "opportunity_player": pin_state.get("opportunity_player"),
+        }
 
     # Verificar vetos
     active_vetos = _check_vetos(context_flags)
@@ -317,16 +370,35 @@ def _run_cycle() -> tuple[int, int]:
 
         if alert:
             try:
-                level    = alert["alert_level"]
-                cooldown = ALERT_COOLDOWN_SECONDS.get(level, 300)
-                sent     = notifier.send_alert(alert, cooldown_seconds=cooldown)
+                level        = alert["alert_level"]
+                both_sources = alert["both_sources"]
+                market_spi   = alert["market_spi"]
+                cooldown     = ALERT_COOLDOWN_SECONDS.get(level, 300)
+
+                # Regla de fuente única:
+                # AMBER fuente única → solo enviar si market_spi >= 85 (señal extrema)
+                # De lo contrario solo loguear como observación
+                if not both_sources and market_spi < 85:
+                    _log_alert(
+                        alert["player_home"], alert["player_away"],
+                        alert["tournament"], alert["status"],
+                        alert["cancha_spi"], alert["cancha_signals"],
+                        alert["market_spi"], alert["market_signals"],
+                        alert["total_spi"], alert["adjusted_spi"],
+                        alert["alert_level"], False,
+                        alert["reductions"], sent=None
+                    )
+                    logger.info(f"     [⚠️  OBSERVACIÓN] Fuente única — no se envía a Telegram")
+                    continue
+
+                sent = notifier.send_alert(alert, cooldown_seconds=cooldown)
                 _log_alert(
                     alert["player_home"], alert["player_away"],
                     alert["tournament"], alert["status"],
                     alert["cancha_spi"], alert["cancha_signals"],
                     alert["market_spi"], alert["market_signals"],
                     alert["total_spi"], alert["adjusted_spi"],
-                    alert["alert_level"], alert["both_sources"],
+                    alert["alert_level"], both_sources,
                     alert["reductions"], sent=sent
                 )
                 if sent:
@@ -358,9 +430,26 @@ def _run_cycle() -> tuple[int, int]:
 
             if alert:
                 try:
-                    level    = alert["alert_level"]
-                    cooldown = ALERT_COOLDOWN_SECONDS.get(level, 300)
-                    sent     = notifier.send_alert(alert, cooldown_seconds=cooldown)
+                    level      = alert["alert_level"]
+                    market_spi = alert["market_spi"]
+                    cooldown   = ALERT_COOLDOWN_SECONDS.get(level, 300)
+
+                    # Pinnacle-only → siempre fuente única
+                    # Solo enviar si market_spi >= 85 (señal extrema)
+                    if market_spi < 85:
+                        _log_alert(
+                            alert["player_home"], alert["player_away"],
+                            alert["tournament"], alert["status"],
+                            0, [],
+                            alert["market_spi"], alert["market_signals"],
+                            alert["total_spi"], alert["adjusted_spi"],
+                            alert["alert_level"], False,
+                            alert["reductions"], sent=None
+                        )
+                        logger.info(f"     [⚠️  OBSERVACIÓN] Pinnacle-only — no se envía a Telegram")
+                        continue
+
+                    sent = notifier.send_alert(alert, cooldown_seconds=cooldown)
                     _log_alert(
                         alert["player_home"], alert["player_away"],
                         alert["tournament"], alert["status"],

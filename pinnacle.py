@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from config import (
     PINNODDS_API_KEY,
     PINNODDS_SSE_LIVE,
-    PINNODDS_MIN_DROP_PCT,
+    PINNODDS_MIN_RISE_PCT,
     SPI_WEIGHTS_PINNACLE,
 )
 
@@ -115,7 +115,7 @@ def _process_market_event(event: dict):
         signals.append("odds_spike")
         logger.info(f"  PIN +{SPI_WEIGHTS_PINNACLE['odds_spike']:<2} → 💰 Cuota subió fuerte (↑{rise_pct:.1f}% en {interval}min) [{home} vs {away}]")
     # Cuota sube moderado sin recuperar (5-14%)
-    elif rise_pct >= PINNODDS_MIN_DROP_PCT:
+    elif rise_pct >= PINNODDS_MIN_RISE_PCT:
         signals.append("no_recovery_movement")
         logger.debug(f"  PIN +{SPI_WEIGHTS_PINNACLE['no_recovery_movement']:<2} → 💰 Cuota sube sin recuperar (↑{rise_pct:.1f}%) [{home} vs {away}]")
 

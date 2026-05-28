@@ -224,19 +224,23 @@ def evaluate_pinnacle_only(event_id: str, market_state: dict) -> dict | None:
     if market_spi < SPI_THRESHOLD_AMBER:
         return None
 
-    # Fix 1+5: veto de partido recién iniciado usando games de GoalServe
-    # Buscar el partido en GoalServe por nombre para obtener el conteo real de games
-    # Si games=0 probablemente es error de lectura — solo vetar si 0 < games < 3
-    gs_match = _find_goalserve_match(home, away, _last_gs_matches)
-    if gs_match:
-        raw_match   = gs_match.get("raw_match", {})
-        total_games = tracker._count_total_games(raw_match.get("sets", {}))
-        if 0 < total_games < 3:
-            _log_alert(home, away, league, "in_progress",
-                       0, [], market_spi, market_signals,
-                       market_spi, market_spi, "vetado", False, [],
-                       veto=f"partido recién iniciado (games={total_games} según GoalServe)")
-            return None
+    # Veto de partido recién iniciado — usar games de GoalServe, no de Pinnacle
+    # Solo vetar si 0 < games < 3 (games=0 suele ser error de lectura)
+    home_s = _extract_surnames(home)
+    away_s = _extract_surnames(away)
+    for gs in _last_gs_matches:
+        gs_h = _extract_surnames(gs.get("player_home", ""))
+        gs_a = _extract_surnames(gs.get("player_away", ""))
+        if (home_s & gs_h) and (away_s & gs_a):
+            raw_match   = gs.get("raw_match", {})
+            total_games = tracker.count_total_games(raw_match.get("sets", {}))
+            if 0 < total_games < 3:
+                _log_alert(home, away, league, "in_progress",
+                           0, [], market_spi, market_signals,
+                           market_spi, market_spi, "vetado", False, [],
+                           veto=f"partido recién iniciado (games={total_games} GoalServe)")
+                return None
+            break
 
     is_challenger = any(k in league.lower() for k in ["challenger", "itf", "125k", "future"])
     adjusted_spi, reductions = _apply_reductions(market_spi, is_challenger)

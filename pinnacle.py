@@ -41,7 +41,7 @@ def _parse_event(raw_data: str):
 def _process_market_event(event: dict):
     """
     Procesa un evento individual del SSE.
-    Solo tenis. Guarda cuotas actuales y determina jugador en riesgo.
+    Solo tenis Moneyline — filtra mercados (Games) y otros tipos de apuesta.
     """
     global _events_received, _tennis_events
     _events_received += 1
@@ -61,34 +61,34 @@ def _process_market_event(event: dict):
     outcome    = event.get("outcome", "")
     sect       = event.get("sect", "").lower()
     interval   = int(event.get("interval", 0) or 0)
-    home_score = event.get("home_score")   # games/sets jugados
-    away_score = event.get("away_score")
+
+    # Fix 2: filtrar mercados "(Games)" — contaminan el bot
+    if "(games)" in home.lower() or "(games)" in away.lower():
+        return
+
+    # Fix 2: solo Moneyline para este bot de riesgo físico
+    if sect != "moneyline":
+        return
 
     if not event_id or from_price == 0 or to_price == 0:
-        logger.debug(f"[PINNACLE] Evento tenis incompleto — id={event_id} from={from_price} to={to_price}")
+        logger.debug(f"[PINNACLE] Evento incompleto — id={event_id} from={from_price} to={to_price}")
         return
 
     drop_pct = abs((from_price - to_price) / from_price * 100)
 
     signals = []
-    score   = 0
 
-    if interval >= 120:
+    # Fix 3: interval real de suspensión live — entre 2 y 15 min
+    # Valores altos (60+, 120+) son datos viejos o pre-partido, no suspensión real
+    if 2 <= interval <= 15:
         signals.append("market_suspended")
-        score += SPI_WEIGHTS_PINNACLE["market_suspended"]
         logger.info(f"  PIN +{SPI_WEIGHTS_PINNACLE['market_suspended']:<2} → 💰 Mercado suspendido (interval={interval}min) [{home} vs {away}]")
-    elif interval >= 60:
-        signals.append("market_slow_return")
-        score += SPI_WEIGHTS_PINNACLE["market_slow_return"]
-        logger.info(f"  PIN +{SPI_WEIGHTS_PINNACLE['market_slow_return']:<2} → 💰 Mercado tardó en retomar (interval={interval}min) [{home} vs {away}]")
 
     if drop_pct >= 15 and interval <= 30:
         signals.append("odds_spike")
-        score += SPI_WEIGHTS_PINNACLE["odds_spike"]
         logger.info(f"  PIN +{SPI_WEIGHTS_PINNACLE['odds_spike']:<2} → 💰 Cuota subió fuerte y rápido (drop={drop_pct:.1f}% en {interval}min) [{home} vs {away}]")
     elif drop_pct >= PINNODDS_MIN_DROP_PCT:
         signals.append("no_recovery_movement")
-        score += SPI_WEIGHTS_PINNACLE["no_recovery_movement"]
         logger.debug(f"  PIN +{SPI_WEIGHTS_PINNACLE['no_recovery_movement']:<2} → 💰 Movimiento sin recuperación (drop={drop_pct:.1f}%) [{home} vs {away}]")
 
     if not signals:
@@ -96,20 +96,19 @@ def _process_market_event(event: dict):
 
     now = datetime.now(timezone.utc)
 
-    # Determinar jugador en riesgo desde Moneyline
+    # Determinar jugador en riesgo
     risk_player        = None
     opportunity_player = None
     risk_odds          = None
 
-    if sect == "moneyline":
-        if "home" in outcome.lower():
-            risk_player        = home
-            opportunity_player = away
-            risk_odds          = round(to_price, 2)
-        elif "away" in outcome.lower():
-            risk_player        = away
-            opportunity_player = home
-            risk_odds          = round(to_price, 2)
+    if "home" in outcome.lower():
+        risk_player        = home
+        opportunity_player = away
+        risk_odds          = round(to_price, 2)
+    elif "away" in outcome.lower():
+        risk_player        = away
+        opportunity_player = home
+        risk_odds          = round(to_price, 2)
 
     with _state_lock:
         current = _market_states.get(event_id, {})
@@ -119,25 +118,25 @@ def _process_market_event(event: dict):
         current_home_odds = current.get("home_odds")
         current_away_odds = current.get("away_odds")
 
-        if sect == "moneyline":
-            if "home" in outcome.lower():
-                current_home_odds = round(to_price, 2)
-            elif "away" in outcome.lower():
-                current_away_odds = round(to_price, 2)
+        if "home" in outcome.lower():
+            current_home_odds = round(to_price, 2)
+        elif "away" in outcome.lower():
+            current_away_odds = round(to_price, 2)
 
         final_risk        = risk_player        or current.get("risk_player")
         final_opportunity = opportunity_player or current.get("opportunity_player")
         final_risk_odds   = risk_odds          or current.get("risk_odds")
 
-        # Calcular total de games jugados
-        try:
-            total_games = (int(home_score or 0)) + (int(away_score or 0))
-        except (TypeError, ValueError):
-            total_games = current.get("total_games", 0)
+        # Fix 4: calcular market_spi como suma real de todas las señales activas
+        new_spi = sum(
+            SPI_WEIGHTS_PINNACLE[s]
+            for s in existing_signals
+            if s in SPI_WEIGHTS_PINNACLE
+        )
 
         _market_states[event_id] = {
             "signals":            list(existing_signals),
-            "market_spi":         max(current.get("market_spi", 0), score),
+            "market_spi":         new_spi,
             "last_updated":       now,
             "home":               home,
             "away":               away,
@@ -147,7 +146,7 @@ def _process_market_event(event: dict):
             "risk_player":        final_risk,
             "opportunity_player": final_opportunity,
             "risk_odds":          final_risk_odds,
-            "total_games":        max(current.get("total_games", 0), total_games),
+            "total_games":        current.get("total_games", 0),  # se actualiza desde GoalServe
         }
 
 

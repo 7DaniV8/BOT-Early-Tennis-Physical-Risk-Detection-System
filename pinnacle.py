@@ -70,26 +70,54 @@ def _process_market_event(event: dict):
     if sect != "moneyline":
         return
 
-    if not event_id or from_price == 0 or to_price == 0:
-        logger.debug(f"[PINNACLE] Evento incompleto — id={event_id} from={from_price} to={to_price}")
+    if not event_id or from_price == 0:
+        logger.debug(f"[PINNACLE] Evento incompleto — id={event_id} from={from_price}")
         return
 
-    drop_pct = abs((from_price - to_price) / from_price * 100)
+    # Cuota desaparece — to_price llega en 0 o nulo
+    if to_price == 0:
+        now = datetime.now(timezone.utc)
+        signals = ["odds_disappeared"]
+        logger.info(f"  PIN +{SPI_WEIGHTS_PINNACLE['odds_disappeared']:<2} → 💰 Cuota desaparece del mercado [{home} vs {away}]")
+        with _state_lock:
+            current          = _market_states.get(event_id, {})
+            existing_signals = set(current.get("signals", []))
+            existing_signals.update(signals)
+            new_spi = sum(SPI_WEIGHTS_PINNACLE[s] for s in existing_signals if s in SPI_WEIGHTS_PINNACLE)
+            _market_states[event_id] = {
+                **current,
+                "signals":      list(existing_signals),
+                "market_spi":   new_spi,
+                "last_updated": now,
+                "home":         home,
+                "away":         away,
+                "league":       league,
+            }
+        return
+
+    # Para riesgo físico: lo importante es que la cuota SUBA
+    # cuota sube = mercado castiga al jugador = posible problema
+    # cuota baja = mercado confía más = no es señal de riesgo
+    if to_price <= from_price:
+        return   # cuota bajó o igual → no es señal de riesgo físico
+
+    rise_pct = (to_price - from_price) / from_price * 100
 
     signals = []
 
-    # Fix 3: interval real de suspensión live — entre 2 y 15 min
-    # Valores altos (60+, 120+) son datos viejos o pre-partido, no suspensión real
+    # Mercado suspendido — interval real entre 2 y 15 min
     if 2 <= interval <= 15:
         signals.append("market_suspended")
         logger.info(f"  PIN +{SPI_WEIGHTS_PINNACLE['market_suspended']:<2} → 💰 Mercado suspendido (interval={interval}min) [{home} vs {away}]")
 
-    if drop_pct >= 15 and interval <= 30:
+    # Cuota sube fuerte y rápido (+15% en menos de 30 min)
+    if rise_pct >= 15 and interval <= 30:
         signals.append("odds_spike")
-        logger.info(f"  PIN +{SPI_WEIGHTS_PINNACLE['odds_spike']:<2} → 💰 Cuota subió fuerte y rápido (drop={drop_pct:.1f}% en {interval}min) [{home} vs {away}]")
-    elif drop_pct >= PINNODDS_MIN_DROP_PCT:
+        logger.info(f"  PIN +{SPI_WEIGHTS_PINNACLE['odds_spike']:<2} → 💰 Cuota subió fuerte (↑{rise_pct:.1f}% en {interval}min) [{home} vs {away}]")
+    # Cuota sube moderado sin recuperar (5-14%)
+    elif rise_pct >= PINNODDS_MIN_DROP_PCT:
         signals.append("no_recovery_movement")
-        logger.debug(f"  PIN +{SPI_WEIGHTS_PINNACLE['no_recovery_movement']:<2} → 💰 Movimiento sin recuperación (drop={drop_pct:.1f}%) [{home} vs {away}]")
+        logger.debug(f"  PIN +{SPI_WEIGHTS_PINNACLE['no_recovery_movement']:<2} → 💰 Cuota sube sin recuperar (↑{rise_pct:.1f}%) [{home} vs {away}]")
 
     if not signals:
         return

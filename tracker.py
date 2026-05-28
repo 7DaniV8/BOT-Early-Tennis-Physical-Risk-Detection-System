@@ -205,57 +205,73 @@ def _calculate_cancha_spi(match: dict, match_id: str) -> tuple[int, list[str]]:
     status  = match.get("status", "").lower()
     home    = match.get("player_home", "?")
     away    = match.get("player_away", "?")
+    prev    = _match_states.get(match_id, {})
 
-    # Partido suspendido / retirado
-    if any(k in status for k in ["suspended", "interrupted", "walkover", "retired", "retire"]):
+    # Walkover / no show → señal inmediata más fuerte
+    if any(k in status for k in ["walkover", "no_show", "noshow"]):
+        signals.append("walkover_noshown")
+        score += SPI_WEIGHTS_GOALSERVE["walkover_noshown"]
+        logger.info(f"  GS  +{SPI_WEIGHTS_GOALSERVE['walkover_noshown']:<2} → 🚨 Walkover / No Show (status='{status}') [{home} vs {away}]")
+
+    # Partido suspendido / retired / interrupted
+    elif any(k in status for k in ["suspended", "interrupted", "retired", "retire"]):
         signals.append("match_suspended")
         score += SPI_WEIGHTS_GOALSERVE["match_suspended"]
         logger.info(f"  GS  +{SPI_WEIGHTS_GOALSERVE['match_suspended']:<2} → Partido suspendido (status='{status}') [{home} vs {away}]")
 
-    # Bajón de rendimiento por pérdida de sets
-    home_sets = match.get("home_sets_won", 0)
-    away_sets = match.get("away_sets_won", 0)
-    prev      = _match_states.get(match_id, {})
-    prev_home = prev.get("_home_sets_won", home_sets)
-    if prev_home > home_sets and home_sets == 0:
-        signals.append("performance_drop")
-        score += SPI_WEIGHTS_GOALSERVE["performance_drop"]
-        logger.info(f"  GS  +{SPI_WEIGHTS_GOALSERVE['performance_drop']:<2} → Bajón de rendimiento (sets: {prev_home}→{home_sets}) [{home} vs {away}]")
+    # Score congelado — NO contar si hay tie break activo
+    is_tiebreak = "tiebreak" in status or "tie break" in status
+    if not is_tiebreak:
+        current_score = (
+            f"{match.get('home_sets_won',0)}-{match.get('away_sets_won',0)}"
+            f"/{match.get('home_game_score','0')}-{match.get('away_game_score','0')}"
+        )
+        freeze_pts = _detect_score_freeze(match_id, current_score)
+        if freeze_pts > 0:
+            tag = "score_frozen_10min" if freeze_pts == 10 else "score_frozen_5min"
+            min_label = "10+ min" if freeze_pts == 10 else "5–7 min"
+            signals.append(tag)
+            score += freeze_pts
+            logger.info(f"  GS  +{freeze_pts:<2} → Score congelado {min_label} [{home} vs {away}]")
+    else:
+        logger.debug(f"  GS  Score freeze ignorado — tie break activo [{home} vs {away}]")
 
-    # Breaks consecutivos
-    home_serve   = match.get("home_serve", False)
-    home_g_score = match.get("home_game_score", "0")
-    away_g_score = match.get("away_game_score", "0")
-    serving_losing = (
+    # Pierde game después de ir 40-0 arriba
+    home_serve      = match.get("home_serve", False)
+    home_g_score    = match.get("home_game_score", "0")
+    away_g_score    = match.get("away_game_score", "0")
+    prev_home_score = prev.get("_prev_home_game_score", "0")
+    prev_away_score = prev.get("_prev_away_game_score", "0")
+
+    lost_from_4000 = (
+        (home_serve and prev_home_score == "40" and prev_away_score == "00" and home_g_score == "0") or
+        (not home_serve and prev_away_score == "40" and prev_home_score == "00" and away_g_score == "0")
+    )
+    if lost_from_4000:
+        signals.append("game_lost_from_4000")
+        score += SPI_WEIGHTS_GOALSERVE["game_lost_from_4000"]
+        logger.info(f"  GS  +{SPI_WEIGHTS_GOALSERVE['game_lost_from_4000']:<2} → Perdió game desde 40-0 arriba [{home} vs {away}]")
+
+    # 3 veces llegando a 0-40 con saque propio
+    serving_at_0_40 = (
         (home_serve and home_g_score == "00" and away_g_score == "40") or
         (not home_serve and away_g_score == "00" and home_g_score == "40")
     )
     consec_breaks = prev.get("_consecutive_serving_losses", 0)
-    consec_breaks = consec_breaks + 1 if serving_losing else 0
+    consec_breaks = consec_breaks + 1 if serving_at_0_40 else 0
     _match_states.setdefault(match_id, {})
     _match_states[match_id]["_consecutive_serving_losses"] = consec_breaks
 
     if consec_breaks >= 3:
         signals.append("consecutive_breaks")
         score += SPI_WEIGHTS_GOALSERVE["consecutive_breaks"]
-        logger.info(f"  GS  +{SPI_WEIGHTS_GOALSERVE['consecutive_breaks']:<2} → Pierde servicios seguidos ({consec_breaks}) [{home} vs {away}]")
-
-    # Score congelado
-    current_score = (
-        f"{match.get('home_sets_won',0)}-{match.get('away_sets_won',0)}"
-        f"/{match.get('home_game_score','0')}-{match.get('away_game_score','0')}"
-    )
-    freeze_pts = _detect_score_freeze(match_id, current_score)
-    if freeze_pts > 0:
-        tag = "score_frozen_10min" if freeze_pts == 10 else "score_frozen_5min"
-        min_label = "10+ min" if freeze_pts == 10 else "5–7 min"
-        signals.append(tag)
-        score += freeze_pts
-        logger.info(f"  GS  +{freeze_pts:<2} → Score congelado {min_label} [{home} vs {away}]")
+        logger.info(f"  GS  +{SPI_WEIGHTS_GOALSERVE['consecutive_breaks']:<2} → 3 veces a 0-40 con saque propio [{home} vs {away}]")
 
     # Guardar estado
-    _match_states[match_id]["_home_sets_won"] = home_sets
-    _match_states[match_id]["_away_sets_won"] = away_sets
+    _match_states[match_id]["_home_sets_won"]        = match.get("home_sets_won", 0)
+    _match_states[match_id]["_away_sets_won"]        = match.get("away_sets_won", 0)
+    _match_states[match_id]["_prev_home_game_score"] = home_g_score
+    _match_states[match_id]["_prev_away_game_score"] = away_g_score
 
     return score, signals
 

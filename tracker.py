@@ -124,6 +124,11 @@ def _is_challenger_itf(tournament_name: str) -> bool:
     return any(k in tournament_name.lower() for k in keywords)
 
 
+def count_total_games(sets: dict) -> int:
+    """Función pública para usar desde main.py."""
+    return _count_total_games(sets)
+
+
 def _count_total_games(sets: dict) -> int:
     total = 0
     for key, val in sets.items():

@@ -37,6 +37,7 @@ logger = logging.getLogger("main")
 _cycle_count        = 0
 _total_alerts_sent  = 0
 _consecutive_errors = 0
+_last_gs_matches    = []   # último batch de GoalServe — usado para veto de games
 MAX_CONSECUTIVE_ERRORS = 10
 
 
@@ -219,18 +220,23 @@ def evaluate_pinnacle_only(event_id: str, market_state: dict) -> dict | None:
     home           = market_state.get("home", "")
     away           = market_state.get("away", "")
     league         = market_state.get("league", "")
-    total_games    = market_state.get("total_games", 0)
 
     if market_spi < SPI_THRESHOLD_AMBER:
         return None
 
-    # Filtro: partido recién iniciado
-    if total_games < 3:
-        _log_alert(home, away, league, "in_progress",
-                   0, [], market_spi, market_signals,
-                   market_spi, market_spi, "vetado", False, [],
-                   veto=f"partido recién iniciado (games={total_games})")
-        return None
+    # Fix 1+5: veto de partido recién iniciado usando games de GoalServe
+    # Buscar el partido en GoalServe por nombre para obtener el conteo real de games
+    # Si games=0 probablemente es error de lectura — solo vetar si 0 < games < 3
+    gs_match = _find_goalserve_match(home, away, _last_gs_matches)
+    if gs_match:
+        raw_match   = gs_match.get("raw_match", {})
+        total_games = tracker._count_total_games(raw_match.get("sets", {}))
+        if 0 < total_games < 3:
+            _log_alert(home, away, league, "in_progress",
+                       0, [], market_spi, market_signals,
+                       market_spi, market_spi, "vetado", False, [],
+                       veto=f"partido recién iniciado (games={total_games} según GoalServe)")
+            return None
 
     is_challenger = any(k in league.lower() for k in ["challenger", "itf", "125k", "future"])
     adjusted_spi, reductions = _apply_reductions(market_spi, is_challenger)
@@ -286,8 +292,11 @@ def _validate_config():
 def _run_cycle() -> tuple[int, int]:
     alerts_sent = 0
 
+    global _last_gs_matches
+
     try:
         matches = tracker.process_matches()
+        _last_gs_matches = matches   # actualizar para veto de games en Pinnacle-only
     except Exception as e:
         logger.error(f"[GOALSERVE] Fallo al obtener partidos: {e}")
         matches = []

@@ -288,13 +288,36 @@ def process_matches() -> list[dict]:
             continue
 
         try:
-            prev_state    = _match_states.get(match_id)
-            context_flags = _build_context_flags(match, prev_state)
-            cancha_spi, cancha_signals = _calculate_cancha_spi(match, match_id)
             tournament_name = match.get("_tournament_name", "")
             is_challenger   = _is_challenger_itf(tournament_name)
 
-            _match_states.setdefault(match_id, {})
+            # Fix 1: asegurar que el estado existe ANTES de calcular
+            # _calculate_cancha_spi depende del estado previo para señales
+            # como score_freeze, consecutive_breaks, game_lost_from_4000
+            _match_states.setdefault(match_id, {
+                "_consecutive_serving_losses": 0,
+                "_prev_home_game_score":       "0",
+                "_prev_away_game_score":       "0",
+                "_home_sets_won":              0,
+                "_away_sets_won":              0,
+                "_missing_cycles":             0,
+            })
+
+            # Reset missing cycles — el partido volvió a aparecer
+            _match_states[match_id]["_missing_cycles"] = 0
+
+            prev_state    = _match_states.get(match_id)
+            context_flags = _build_context_flags(match, prev_state)
+            cancha_spi, cancha_signals = _calculate_cancha_spi(match, match_id)
+
+            # Log diagnóstico — siempre visible para detectar si GoalServe genera señales
+            # pero main.py las bloquea
+            logger.info(
+                f"[GS DEBUG] {match.get('player_home','?')} vs {match.get('player_away','?')} | "
+                f"SPI={cancha_spi} | signals={cancha_signals} | "
+                f"flags={[f for f,v in _build_context_flags(match, _match_states.get(match_id)).items() if v]}"
+            )
+
             _match_states[match_id].update({
                 **context_flags,
                 "_current_set": _current_set_number(match.get("sets", {})),
@@ -324,7 +347,12 @@ def cleanup_finished_matches(active_ids: list[str]):
     removed = 0
     for mid in list(_match_states.keys()):
         if mid not in active_ids:
-            del _match_states[mid]
-            removed += 1
+            _match_states[mid]["_missing_cycles"] = \
+                _match_states[mid].get("_missing_cycles", 0) + 1
+            if _match_states[mid]["_missing_cycles"] >= 20:
+                del _match_states[mid]
+                removed += 1
+        else:
+            _match_states[mid]["_missing_cycles"] = 0
     if removed:
-        logger.debug(f"[CLEANUP] {removed} partidos eliminados del estado en memoria")
+        logger.debug(f"[CLEANUP] {removed} partidos eliminados tras faltar varios ciclos")

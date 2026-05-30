@@ -47,9 +47,15 @@ SPI_WEIGHTS_PINNACLE = {
     "odds_trend":             6,   # tendencia alcista en 3 movimientos seguidos
 }
 
-# ── Umbrales de alerta ────────────────────────────────────────
-SPI_THRESHOLD_RED   = 80   # alerta roja (ambas fuentes requeridas)
-SPI_THRESHOLD_AMBER = 55   # subido de 40 a 55 — más exigente
+# ── Umbrales de alerta — ATP/WTA ─────────────────────────────
+SPI_THRESHOLD_RED     = 75   # alerta fuerte
+SPI_THRESHOLD_AMBER   = 60   # alerta media
+SPI_THRESHOLD_OBSERVE = 40   # solo log
+
+# ── Umbrales de alerta — Challenger/ITF (más flexibles) ──────
+SPI_THRESHOLD_RED_CHALLENGER   = 70
+SPI_THRESHOLD_AMBER_CHALLENGER = 55
+SPI_THRESHOLD_OBSERVE_CHALLENGER = 35
 
 # ── Señales de alerta inmediata ───────────────────────────────
 # Disparan Telegram sin importar SPI ni doble fuente

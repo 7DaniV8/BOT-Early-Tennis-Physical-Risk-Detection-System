@@ -12,6 +12,10 @@ from config import (
     GOALSERVE_POLL_OFFSET,
     SPI_THRESHOLD_RED,
     SPI_THRESHOLD_AMBER,
+    SPI_THRESHOLD_OBSERVE,
+    SPI_THRESHOLD_RED_CHALLENGER,
+    SPI_THRESHOLD_AMBER_CHALLENGER,
+    SPI_THRESHOLD_OBSERVE_CHALLENGER,
     SPI_REDUCTION_CHALLENGER,
     SPI_REDUCTION_API_DELAY,
     VETO_FLAGS,
@@ -109,6 +113,9 @@ def _log_alert(player_home: str, player_away: str, tournament: str,
     elif alert_level == "amber" and not both_sources:
         nivel_str = "nivel=OBSERVACIÓN"
         fuentes   = "⚠️  fuente única"
+    elif alert_level == "observe":
+        nivel_str = "nivel=OBSERVE"
+        fuentes   = "✅ doble fuente" if both_sources else "⚠️  fuente única"
     else:
         nivel_str = f"nivel={alert_level.upper()}"
         fuentes   = "✅ doble fuente" if both_sources else "⚠️  fuente única"
@@ -140,16 +147,41 @@ def _extract_surnames(full_name: str) -> set[str]:
 
 # ── SPI Engine ────────────────────────────────────────────────
 
-def _resolve_alert_level(spi: int, both_sources: bool) -> str:
-    if spi >= SPI_THRESHOLD_RED and both_sources:
+def _resolve_alert_level(spi: int, both_sources: bool,
+                          is_challenger: bool = False) -> str | None:
+    """
+    3 niveles por fuente y tipo de torneo:
+
+    ATP/WTA:
+      75+  → red   (doble fuente) / amber (fuente única)
+      60+  → amber (doble fuente) / observe (fuente única)
+      40+  → observe
+
+    Challenger/ITF (más flexible):
+      70+  → red   (doble fuente) / amber (fuente única)
+      55+  → amber (doble fuente) / observe (fuente única)
+      35+  → observe
+    """
+    if is_challenger:
+        t_red     = SPI_THRESHOLD_RED_CHALLENGER
+        t_amber   = SPI_THRESHOLD_AMBER_CHALLENGER
+        t_observe = SPI_THRESHOLD_OBSERVE_CHALLENGER
+    else:
+        t_red     = SPI_THRESHOLD_RED
+        t_amber   = SPI_THRESHOLD_AMBER
+        t_observe = SPI_THRESHOLD_OBSERVE
+
+    if spi >= t_red and both_sources:
         return "red"
-    if spi >= SPI_THRESHOLD_RED and not both_sources:
+    if spi >= t_red and not both_sources:
         return "amber"
-    if spi >= SPI_THRESHOLD_AMBER and both_sources:
+    if spi >= t_amber and both_sources:
         return "amber"
-    if spi >= SPI_THRESHOLD_AMBER and not both_sources:
-        return "amber"   # antes era yellow — ahora mínimo es amber
-    return None   # por debajo del umbral → no alerta
+    if spi >= t_amber and not both_sources:
+        return "observe"
+    if spi >= t_observe:
+        return "observe"
+    return None
 
 
 def _apply_reductions(spi: int, is_challenger: bool, api_delay: bool = False) -> tuple[int, list[str]]:
@@ -235,10 +267,10 @@ def evaluate_match(match_data: dict, all_goalserve_matches: list[dict]) -> dict 
 
     adjusted_spi, reductions = _apply_reductions(total_spi, is_challenger)
 
-    if adjusted_spi < SPI_THRESHOLD_AMBER:
+    if adjusted_spi < SPI_THRESHOLD_OBSERVE:
         return None
 
-    alert_level = _resolve_alert_level(adjusted_spi, both_sources)
+    alert_level = _resolve_alert_level(adjusted_spi, both_sources, is_challenger)
     if alert_level is None:
         return None
 
@@ -375,9 +407,19 @@ def _run_cycle() -> tuple[int, int]:
                 market_spi   = alert["market_spi"]
                 cooldown     = ALERT_COOLDOWN_SECONDS.get(level, 300)
 
-                # Regla de fuente única:
-                # AMBER fuente única → solo enviar si market_spi >= 85 (señal extrema)
-                # De lo contrario solo loguear como observación
+                # observe → solo log, nunca Telegram
+                if level == "observe":
+                    _log_alert(
+                        alert["player_home"], alert["player_away"],
+                        alert["tournament"], alert["status"],
+                        alert["cancha_spi"], alert["cancha_signals"],
+                        alert["market_spi"], alert["market_signals"],
+                        alert["total_spi"], alert["adjusted_spi"],
+                        "observe", both_sources, alert["reductions"], sent=None
+                    )
+                    continue
+
+                # amber/red fuente única → solo si market_spi >= 85
                 if not both_sources and market_spi < 85:
                     _log_alert(
                         alert["player_home"], alert["player_away"],

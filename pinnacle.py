@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 _market_states: dict[str, dict] = {}
 _state_lock    = threading.Lock()
-SIGNAL_TTL     = 120
+SIGNAL_TTL     = 600
 
 # Contadores de diagnóstico SSE
 _events_received  = 0

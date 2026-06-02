@@ -18,9 +18,14 @@ from config import (
     SPI_THRESHOLD_OBSERVE_CHALLENGER,
     SPI_REDUCTION_CHALLENGER,
     SPI_REDUCTION_API_DELAY,
-    VETO_FLAGS,
+    VETO_FLAGS_HARD,
+    VETO_FLAGS_SOFT,
+    VETO_SOFT_IMMUNE_SIGNALS,
     ALERT_COOLDOWN_SECONDS,
     IMMEDIATE_ALERT_SIGNALS,
+    STRONG_CANCHA_SIGNALS,
+    STRONG_MARKET_SIGNALS,
+    REQUIRE_STRONG_MARKET_FOR_CHALLENGER,
     LOG_LEVEL,
     LOG_FILE,
 )
@@ -42,7 +47,7 @@ logger = logging.getLogger("main")
 _cycle_count        = 0
 _total_alerts_sent  = 0
 _consecutive_errors = 0
-_last_gs_matches    = []   # último batch de GoalServe — usado para veto de games
+_last_gs_matches    = []
 MAX_CONSECUTIVE_ERRORS = 10
 
 
@@ -50,19 +55,23 @@ MAX_CONSECUTIVE_ERRORS = 10
 
 def _signal_label(signal: str) -> str:
     labels = {
-        # GoalServe
-        "walkover_noshown":     "🚨 Walkover / No Show",
-        "match_suspended":      "Partido suspendido / interrumpido",
-        "consecutive_breaks":   "3 veces a 0-40 con saque propio",
-        "game_lost_from_4000":  "Perdió game desde 40-0 arriba",
-        "score_frozen_10min":   "Score congelado 10+ min",
-        "score_frozen_5min":    "Score congelado 5–7 min",
+        # GoalServe — clásicas
+        "walkover_noshown":      "🚨 Walkover / No Show",
+        "match_suspended":       "Partido suspendido / interrumpido",
+        "consecutive_breaks":    "3 veces a 0-40 con saque propio",
+        "game_lost_from_4000":   "Perdió game desde 40-0 arriba",
+        "score_frozen_10min":    "Score congelado 10+ min",
+        "score_frozen_5min":     "Score congelado 5–7 min",
+        # GoalServe — nuevas señales físicas
+        "double_break_same_set": "🎾 Double break en el mismo set",
+        "inset_collapse":        "📉 Colapso dentro del set",
+        "slow_point_pace":       "🐢 Ritmo lento vs su propio promedio",
         # Pinnacle
-        "odds_disappeared":     "🚨 Cuota desaparece del mercado",
-        "market_suspended":     "Mercado suspendido (2–15 min)",
-        "odds_spike":           "Cuota sube 15%+ rápido",
-        "no_recovery_movement": "Cuota sube 5–14% sin recuperar",
-        "odds_trend":           "Tendencia alcista en 3 movimientos",
+        "odds_disappeared":      "🚨 Cuota desaparece del mercado",
+        "market_suspended":      "Mercado suspendido (2–15 min)",
+        "odds_spike":            "Cuota sube 15%+ rápido",
+        "no_recovery_movement":  "Cuota sube 5–14% sin recuperar",
+        "odds_trend":            "Tendencia alcista en 3 movimientos",
     }
     return labels.get(signal, signal)
 
@@ -72,12 +81,11 @@ def _signal_weight(signal: str) -> int:
     return SPI_WEIGHTS_GOALSERVE.get(signal, SPI_WEIGHTS_PINNACLE.get(signal, 0))
 
 
-def _log_alert(player_home: str, player_away: str, tournament: str,
-               status: str, cancha_spi: int, cancha_signals: list,
-               market_spi: int, market_signals: list, total_spi: int,
-               adjusted_spi: int, alert_level: str, both_sources: bool,
-               reductions: list, veto: str = None, sent: bool = None):
-    """Log limpio y legible para cada partido con señal."""
+def _log_alert(player_home, player_away, tournament, status,
+               cancha_spi, cancha_signals, market_spi, market_signals,
+               total_spi, adjusted_spi, alert_level, both_sources,
+               reductions, veto=None, sent=None):
+
     lines = [f"\n→ {player_home} vs {player_away} | {tournament} | {status}"]
 
     for sig in cancha_signals:
@@ -100,19 +108,15 @@ def _log_alert(player_home: str, player_away: str, tournament: str,
     if adjusted_spi != total_spi:
         spi_str += f" → ajustado={adjusted_spi}"
 
-    # Nivel visual
     if alert_level == "immediate":
         nivel_str = "nivel=🚨 ALERTA INMEDIATA"
         fuentes   = "✅ señal crítica"
     elif alert_level == "red":
         nivel_str = "nivel=ALERTA ROJA"
         fuentes   = "✅ doble fuente"
-    elif alert_level == "amber" and both_sources:
+    elif alert_level == "amber":
         nivel_str = "nivel=AMBER"
-        fuentes   = "✅ doble fuente"
-    elif alert_level == "amber" and not both_sources:
-        nivel_str = "nivel=OBSERVACIÓN"
-        fuentes   = "⚠️  fuente única"
+        fuentes   = "✅ doble fuente" if both_sources else "⚠️  cancha doble señal"
     elif alert_level == "observe":
         nivel_str = "nivel=OBSERVE"
         fuentes   = "✅ doble fuente" if both_sources else "⚠️  fuente única"
@@ -123,14 +127,11 @@ def _log_alert(player_home: str, player_away: str, tournament: str,
     lines.append(f"     {spi_str} | {nivel_str} | {fuentes}")
 
     if sent is True:
-        if both_sources:
-            lines.append(f"     [📲 Telegram] Enviada — GoalServe + Pinnacle confirmados")
-        else:
-            lines.append(f"     [📲 Telegram] Enviada — señal Pinnacle extrema")
+        lines.append(f"     [📲 Telegram] Enviada")
     elif sent is False:
         lines.append(f"     [⏸ Telegram] En cooldown — no enviada")
     elif sent is None:
-        lines.append(f"     [⚠️  OBSERVACIÓN] Fuente única — no enviada a Telegram")
+        lines.append(f"     [👁️  OBSERVE] Solo log — no enviada a Telegram")
 
     logger.info("\n".join(lines))
 
@@ -145,23 +146,58 @@ def _extract_surnames(full_name: str) -> set[str]:
     return {p for p in parts if len(p) > 2}
 
 
+# ── Lógica de combinación de señales físicas ─────────────────
+
+def _resolve_physical_alert(
+    cancha_signals: list,
+    market_signals: list,
+    cancha_spi: int,
+    market_spi: int,
+    is_challenger: bool,
+) -> tuple[bool, bool, str | None]:
+    """
+    Decide si la combinación de señales justifica una alerta.
+
+    Retorna: (can_send, both_sources, block_reason)
+
+    Reglas:
+      A) Señal inmediata → siempre pasa (gestionado antes de llegar aquí)
+      B) 1 señal fuerte de cancha + 1 señal de mercado (cualquiera ATP/WTA)
+         En Challenger/ITF: el mercado debe ser señal fuerte
+      C) 2 señales fuertes de cancha → amber sin mercado
+      D) Todo lo demás → observe o bloquear
+    """
+    all_cancha  = set(cancha_signals)
+    all_market  = set(market_signals)
+    strong_c    = all_cancha & STRONG_CANCHA_SIGNALS
+    strong_m    = all_market & STRONG_MARKET_SIGNALS
+    has_market  = market_spi > 0
+
+    # Regla B: señal fuerte de cancha + confirmación de mercado
+    if strong_c and has_market:
+        if is_challenger and REQUIRE_STRONG_MARKET_FOR_CHALLENGER:
+            if strong_m:
+                return True, True, None
+            else:
+                return False, False, "challenger_requires_strong_market"
+        else:
+            return True, True, None
+
+    # Regla C: 2 señales fuertes de cancha sin mercado → amber
+    if len(strong_c) >= 2:
+        return True, False, None
+
+    # Regla D: señal débil sola o única señal fuerte sin mercado → observe
+    if cancha_spi > 0 or market_spi > 0:
+        return False, False, "insufficient_combination"
+
+    return False, False, "no_signal"
+
+
 # ── SPI Engine ────────────────────────────────────────────────
 
 def _resolve_alert_level(spi: int, both_sources: bool,
                           is_challenger: bool = False) -> str | None:
-    """
-    3 niveles por fuente y tipo de torneo:
-
-    ATP/WTA:
-      75+  → red   (doble fuente) / amber (fuente única)
-      60+  → amber (doble fuente) / observe (fuente única)
-      40+  → observe
-
-    Challenger/ITF (más flexible):
-      70+  → red   (doble fuente) / amber (fuente única)
-      55+  → amber (doble fuente) / observe (fuente única)
-      35+  → observe
-    """
     if is_challenger:
         t_red     = SPI_THRESHOLD_RED_CHALLENGER
         t_amber   = SPI_THRESHOLD_AMBER_CHALLENGER
@@ -184,24 +220,31 @@ def _resolve_alert_level(spi: int, both_sources: bool,
     return None
 
 
-def _apply_reductions(spi: int, is_challenger: bool, api_delay: bool = False) -> tuple[int, list[str]]:
+def _apply_reductions(spi: int, is_challenger: bool,
+                       context_flags: dict, all_signals: set) -> tuple[int, list[str]]:
     reductions = []
     adjusted   = float(spi)
+
     if is_challenger:
         adjusted *= (1 - SPI_REDUCTION_CHALLENGER)
         reductions.append(f"Challenger/ITF −{int(SPI_REDUCTION_CHALLENGER*100)}%")
-    if api_delay:
-        adjusted *= (1 - SPI_REDUCTION_API_DELAY)
-        reductions.append(f"Delay de API −{int(SPI_REDUCTION_API_DELAY*100)}%")
+
+    # Vetos suaves — solo si las señales no son inmunes
+    immune = all_signals & VETO_SOFT_IMMUNE_SIGNALS
+    if not immune:
+        for flag, pct in VETO_FLAGS_SOFT.items():
+            if context_flags.get(flag, False):
+                adjusted *= (1 - pct)
+                reductions.append(f"{flag} −{int(pct*100)}%")
+
     return round(adjusted), reductions
 
 
-def _check_vetos(context_flags: dict) -> list[str]:
-    return [flag for flag in VETO_FLAGS if context_flags.get(flag, False)]
+def _check_hard_vetos(context_flags: dict) -> list[str]:
+    return [flag for flag in VETO_FLAGS_HARD if context_flags.get(flag, False)]
 
 
 def evaluate_match(match_data: dict, all_goalserve_matches: list[dict]) -> dict | None:
-    """Evalúa un partido GoalServe cruzando con Pinnacle por apellido."""
     match_id       = match_data["match_id"]
     player_home    = match_data["player_home"]
     player_away    = match_data["player_away"]
@@ -221,17 +264,15 @@ def evaluate_match(match_data: dict, all_goalserve_matches: list[dict]) -> dict 
     market_spi     = pin_state["market_spi"]
     market_signals = pin_state["signals"]
     total_spi      = cancha_spi + market_spi
-    both_sources   = cancha_spi > 0 and market_spi > 0
 
     if total_spi == 0:
         return None
 
-    # Alerta inmediata — walkover, no show, odds_disappeared
-    # Pasa todos los filtros sin importar SPI ni doble fuente
-    all_signals = set(cancha_signals) | set(market_signals)
+    # ── Alerta inmediata ──────────────────────────────────────
+    all_signals  = set(cancha_signals) | set(market_signals)
     is_immediate = any(s in IMMEDIATE_ALERT_SIGNALS for s in all_signals)
     if is_immediate:
-        logger.info(f"  🚨 ALERTA INMEDIATA — señal crítica detectada [{player_home} vs {player_away}]")
+        logger.info(f"  🚨 ALERTA INMEDIATA [{player_home} vs {player_away}]")
         return {
             "match_id":           match_id,
             "player_home":        player_home,
@@ -245,7 +286,7 @@ def evaluate_match(match_data: dict, all_goalserve_matches: list[dict]) -> dict 
             "cancha_signals":     cancha_signals,
             "market_spi":         market_spi,
             "market_signals":     market_signals,
-            "both_sources":       both_sources,
+            "both_sources":       cancha_spi > 0 and market_spi > 0,
             "reductions":         [],
             "context_flags":      context_flags,
             "is_challenger":      is_challenger,
@@ -255,17 +296,34 @@ def evaluate_match(match_data: dict, all_goalserve_matches: list[dict]) -> dict 
             "opportunity_player": pin_state.get("opportunity_player"),
         }
 
-    # Verificar vetos
-    active_vetos = _check_vetos(context_flags)
-    if active_vetos:
+    # ── Vetos duros ───────────────────────────────────────────
+    active_hard_vetos = _check_hard_vetos(context_flags)
+    if active_hard_vetos:
         _log_alert(player_home, player_away, tournament, status,
                    cancha_spi, cancha_signals, market_spi, market_signals,
-                   total_spi, total_spi, "vetado", both_sources, [],
-                   veto=", ".join(active_vetos))
-        notifier.send_veto_log(match_id, player_home, player_away, total_spi, active_vetos)
+                   total_spi, total_spi, "vetado", False, [],
+                   veto=", ".join(active_hard_vetos))
+        notifier.send_veto_log(match_id, player_home, player_away, total_spi, active_hard_vetos)
         return None
 
-    adjusted_spi, reductions = _apply_reductions(total_spi, is_challenger)
+    # ── Lógica de combinación física ──────────────────────────
+    can_send, both_sources, block_reason = _resolve_physical_alert(
+        cancha_signals, market_signals, cancha_spi, market_spi, is_challenger
+    )
+
+    if not can_send:
+        if cancha_spi > 0 or market_spi > 0:
+            logger.debug(
+                f"[EVALUATE] Bloqueado ({block_reason}) — "
+                f"cancha={cancha_spi} market={market_spi} "
+                f"[{player_home} vs {player_away}]"
+            )
+        return None
+
+    # ── Reducciones (challenger + vetos suaves) ───────────────
+    adjusted_spi, reductions = _apply_reductions(
+        total_spi, is_challenger, context_flags, all_signals
+    )
 
     if adjusted_spi < SPI_THRESHOLD_OBSERVE:
         return None
@@ -299,7 +357,6 @@ def evaluate_match(match_data: dict, all_goalserve_matches: list[dict]) -> dict 
 
 
 def evaluate_pinnacle_only(event_id: str, market_state: dict) -> dict | None:
-    """Evalúa partidos solo en Pinnacle. Máximo nivel: amber."""
     market_spi     = market_state["market_spi"]
     market_signals = market_state["signals"]
     home           = market_state.get("home", "")
@@ -309,8 +366,12 @@ def evaluate_pinnacle_only(event_id: str, market_state: dict) -> dict | None:
     if market_spi < SPI_THRESHOLD_AMBER:
         return None
 
-    # Veto de partido recién iniciado — usar games de GoalServe, no de Pinnacle
-    # Solo vetar si 0 < games < 3 (games=0 suele ser error de lectura)
+    # Pinnacle-only: solo enviar si tiene señal fuerte de mercado
+    strong_m = set(market_signals) & STRONG_MARKET_SIGNALS
+    if not strong_m:
+        logger.debug(f"[EVALUATE-PIN] Bloqueado — sin señal fuerte de mercado [{home} vs {away}]")
+        return None
+
     home_s = _extract_surnames(home)
     away_s = _extract_surnames(away)
     for gs in _last_gs_matches:
@@ -323,17 +384,15 @@ def evaluate_pinnacle_only(event_id: str, market_state: dict) -> dict | None:
                 _log_alert(home, away, league, "in_progress",
                            0, [], market_spi, market_signals,
                            market_spi, market_spi, "vetado", False, [],
-                           veto=f"partido recién iniciado (games={total_games} GoalServe)")
+                           veto=f"partido recién iniciado (games={total_games})")
                 return None
             break
 
     is_challenger = any(k in league.lower() for k in ["challenger", "itf", "125k", "future"])
-    adjusted_spi, reductions = _apply_reductions(market_spi, is_challenger)
+    adjusted_spi, reductions = _apply_reductions(market_spi, is_challenger, {}, set(market_signals))
 
     if adjusted_spi < SPI_THRESHOLD_AMBER:
         return None
-
-    alert_level = "amber"   # fuente única → siempre amber, nunca rojo
 
     return {
         "match_id":           event_id,
@@ -343,7 +402,7 @@ def evaluate_pinnacle_only(event_id: str, market_state: dict) -> dict | None:
         "status":             "in_progress",
         "total_spi":          market_spi,
         "adjusted_spi":       adjusted_spi,
-        "alert_level":        alert_level,
+        "alert_level":        "amber",
         "cancha_spi":         0,
         "cancha_signals":     [],
         "market_spi":         market_spi,
@@ -380,12 +439,11 @@ def _validate_config():
 
 def _run_cycle() -> tuple[int, int]:
     alerts_sent = 0
-
     global _last_gs_matches
 
     try:
         matches = tracker.process_matches()
-        _last_gs_matches = matches   # actualizar para veto de games en Pinnacle-only
+        _last_gs_matches = matches
     except Exception as e:
         logger.error(f"[GOALSERVE] Fallo al obtener partidos: {e}")
         matches = []
@@ -404,10 +462,9 @@ def _run_cycle() -> tuple[int, int]:
             try:
                 level        = alert["alert_level"]
                 both_sources = alert["both_sources"]
-                market_spi   = alert["market_spi"]
                 cooldown     = ALERT_COOLDOWN_SECONDS.get(level, 300)
 
-                # observe → solo log, nunca Telegram
+                # observe → solo log
                 if level == "observe":
                     _log_alert(
                         alert["player_home"], alert["player_away"],
@@ -417,20 +474,6 @@ def _run_cycle() -> tuple[int, int]:
                         alert["total_spi"], alert["adjusted_spi"],
                         "observe", both_sources, alert["reductions"], sent=None
                     )
-                    continue
-
-                # amber/red fuente única → solo si market_spi >= 85
-                if not both_sources and market_spi < 85:
-                    _log_alert(
-                        alert["player_home"], alert["player_away"],
-                        alert["tournament"], alert["status"],
-                        alert["cancha_spi"], alert["cancha_signals"],
-                        alert["market_spi"], alert["market_signals"],
-                        alert["total_spi"], alert["adjusted_spi"],
-                        alert["alert_level"], False,
-                        alert["reductions"], sent=None
-                    )
-                    logger.info(f"     [⚠️  OBSERVACIÓN] Fuente única — no se envía a Telegram")
                     continue
 
                 sent = notifier.send_alert(alert, cooldown_seconds=cooldown)
@@ -472,26 +515,9 @@ def _run_cycle() -> tuple[int, int]:
 
             if alert:
                 try:
-                    level      = alert["alert_level"]
-                    market_spi = alert["market_spi"]
-                    cooldown   = ALERT_COOLDOWN_SECONDS.get(level, 300)
-
-                    # Pinnacle-only → siempre fuente única
-                    # Solo enviar si market_spi >= 85 (señal extrema)
-                    if market_spi < 85:
-                        _log_alert(
-                            alert["player_home"], alert["player_away"],
-                            alert["tournament"], alert["status"],
-                            0, [],
-                            alert["market_spi"], alert["market_signals"],
-                            alert["total_spi"], alert["adjusted_spi"],
-                            alert["alert_level"], False,
-                            alert["reductions"], sent=None
-                        )
-                        logger.info(f"     [⚠️  OBSERVACIÓN] Pinnacle-only — no se envía a Telegram")
-                        continue
-
-                    sent = notifier.send_alert(alert, cooldown_seconds=cooldown)
+                    level    = alert["alert_level"]
+                    cooldown = ALERT_COOLDOWN_SECONDS.get(level, 300)
+                    sent     = notifier.send_alert(alert, cooldown_seconds=cooldown)
                     _log_alert(
                         alert["player_home"], alert["player_away"],
                         alert["tournament"], alert["status"],

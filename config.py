@@ -12,7 +12,8 @@ load_dotenv()
 GOALSERVE_API_KEY   = os.getenv("GOALSERVE_API_KEY", "")
 PINNODDS_API_KEY    = os.getenv("PINNODDS_API_KEY", "")
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID         = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_EXPORT_CHAT_ID = os.getenv("TELEGRAM_EXPORT_CHAT_ID", "")
 
 # ── GoalServe ─────────────────────────────────────────────────
 GOALSERVE_BASE_URL      = "https://www.goalserve.com/getfeed"

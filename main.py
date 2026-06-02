@@ -32,6 +32,7 @@ from config import (
 import tracker
 import pinnacle
 import notifier
+import exporter
 
 # ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -488,6 +489,10 @@ def _run_cycle() -> tuple[int, int]:
                 )
                 if sent:
                     alerts_sent += 1
+                    try:
+                        exporter.export_alert(alert)
+                    except Exception as e:
+                        logger.error(f"[EXPORTER] {alert.get('player_home','?')} vs {alert.get('player_away','?')}: {e}")
             except Exception as e:
                 logger.error(f"[NOTIFIER] {alert.get('player_home','?')} vs {alert.get('player_away','?')}: {e}")
 
@@ -529,6 +534,10 @@ def _run_cycle() -> tuple[int, int]:
                     )
                     if sent:
                         alerts_sent += 1
+                        try:
+                            exporter.export_alert(alert)
+                        except Exception as e:
+                            logger.error(f"[EXPORTER-PIN] event_id={event_id}: {e}")
                 except Exception as e:
                     logger.error(f"[NOTIFIER-PIN] event_id={event_id}: {e}")
 
